@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Logs
+*.log
+
+# PDFs (if generated)
+*.pdf
+
+# Node.js
+node_modules/
+
+# Django
+*.sqlite3
+*.db
+*.pot
+*.pyc
+staticfiles/
+media/
+
+# Environment variables
+.env
+
+# Others
+*.bak
+*.swp
+*.swo
