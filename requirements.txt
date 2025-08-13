@@ -6,3 +6,4 @@ pymupdf
 pillow
 scikit-learn
 rapidfuzz
+python-dotenv
