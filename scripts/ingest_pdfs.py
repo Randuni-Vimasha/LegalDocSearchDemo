@@ -52,8 +52,7 @@ def public_url(filename: str) -> str:
 
 def pdf_pages_to_b64_images(pdf_path: str, dpi: int = 300, max_dim: int = 1400):
     """
-    Render each page to PNG bytes (via PyMuPDF), optionally downscale to cap tokens,
-    and return a list of base64 strings ('data:image/png;base64,...' without prefix).
+    Render each page to PNG bytes (via PyMuPDF)
     """
     b64s = []
     with fitz.open(pdf_path) as doc:

@@ -23,19 +23,14 @@
         <!-- realtime suggestions -->
         <div id="suggestions" class="list-group position-absolute w-100 shadow-sm d-none"></div>
       </div>
-      
     </div>
-
-    
   </div>
 
 <script>
   // ---------- helpers ----------
   const DEBOUNCE_MS = 200;
 
-  function debounce(fn, ms) { // waits until user stops typing ~ms
-    let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); };
-  }
+  function debounce(fn, ms) { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
   function escapeHTML(s){ return s.replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
   function highlight(text, query){
     if(!query) return escapeHTML(text);
@@ -61,7 +56,6 @@
   const debouncedSuggest = debounce(fetchSuggestions, DEBOUNCE_MS);
 
   function renderSuggestions(q, items){
-    // dropdown under the input showing best-matching snippets
     const box = document.getElementById("suggestions");
     if(!items.length){ hideSuggestions(); return; }
     box.innerHTML = items.map(s => `
@@ -70,7 +64,7 @@
          data-title="${encodeURIComponent(s.title)}"
          data-url="${s.url || ""}">
         <div class="fw-semibold">${escapeHTML(s.title || "")}</div>
-        <!-- Clicking this sentence will copy into the input -->
+        <!-- Clicking this sentence will NOT change the input -->
         <div class="small text-muted use-sentence">${highlight(s.text || "", q)}</div>
         ${s.url ? `
           <button type="button"
@@ -83,20 +77,20 @@
     box.classList.remove("d-none");
   }
 
-  // ---------- EVENTS ----------
-  // Click a suggestion's sentence -> fill input only (no search)
+  // EVENTS
+  // Clicking a suggestion sentence: keep the user's query; just close the dropdown
   document.getElementById("suggestions").addEventListener("click", (e)=>{
-    if (e.target.closest(".open-pdf")) return;   // 
+    if (e.target.closest(".open-pdf")) return;   // handled by button itself
     const sentenceEl = e.target.closest(".use-sentence");
     if (!sentenceEl) return;
-
-    const item = e.target.closest(".list-group-item");
-    if(!item) return;
     e.preventDefault();
 
-    const sentence = decodeURIComponent(item.dataset.text || "");
-    document.getElementById("q").value = sentence;
-    hideSuggestions(); // 
+    //  copy snippet to clipboard instead of overwriting the input
+    // const item = e.target.closest(".list-group-item");
+    // const sentence = decodeURIComponent(item?.dataset?.text || "");
+    // navigator.clipboard?.writeText(sentence).catch(()=>{});
+
+    hideSuggestions(); // just close – do not modify #q.value
   });
 
   // hide suggestions when clicking outside
@@ -109,8 +103,6 @@
   // wire up type-ahead only
   const qInput = document.getElementById("q");
   qInput.addEventListener("input", e => debouncedSuggest(e.target.value));
-  // No Enter-to-search, no Search button
 </script>
 </body>
 </html>
-
