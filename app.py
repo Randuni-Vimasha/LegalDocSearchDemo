@@ -189,7 +189,7 @@ def doc_hybrid_score(q, q_emb, d):
 
     cos = float(cosine_similarity([q_emb], [emb])[0][0]) if (q_emb is not None and emb is not None) else 0.0
     f_title = fuzzy_score(q.lower(), title)
-    f_cont  = fuzzy_score(q.lower(), content[:1500])
+    f_cont  = fuzzy_score(q.lower(), content)
     return 0.7 * cos + 0.15 * f_title + 0.15 * f_cont, cos
 
 # --- Leading stopword gate ---
