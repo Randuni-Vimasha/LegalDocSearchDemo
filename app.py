@@ -322,7 +322,7 @@ def suggest():
 
         for chunk in chunks:
             chunk_lc = chunk.lower()
-            # NEW: use the best fuzzy score across projected and original-content keys
+            # use the best fuzzy score across projected and original-content keys
             f = max(
                 fuzzy_score(key_q,      chunk_lc),
                 fuzzy_score(orig_key_q, chunk_lc)
