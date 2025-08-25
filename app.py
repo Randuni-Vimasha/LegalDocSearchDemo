@@ -214,8 +214,6 @@ def _strip_leading_stopwords(tokens):
 # --- "X vs Y" title booster ---
 VS_RE = re.compile(r"\b([a-z][a-z\-]{2,})\s+v(?:s\.?)?\s+([a-z][a-z\-]{1,})\b")
 
-#title
-#vs_re matches patterns like sm vs jon
 def _title_hits_for_vs(raw_q: str, docs, top_n=1):
     m = VS_RE.search((raw_q or '').lower())
     if not m:
@@ -248,20 +246,23 @@ def _title_hits_for_vs(raw_q: str, docs, top_n=1):
         })
     return suggestions
 
-# ---  General title-priority hits (not only "X vs Y") ---
+# --- utility for normalized title text ---
+def _norm_title_text(s: str) -> str:
+    # tokenize removes punctuation & ".pdf" effects; lowercased already
+    return " ".join(tokenize(s or ""))
+
+# --- General title-priority hits (robust, normalized) ---
 def _title_hits_general(raw_q: str, docs, top_n=5, min_score=0.80):
     """
-    Rank documents by fuzzy match between the whole query and the doc title.
-    Returns top_n suggestions for titles that score >= min_score.
+    Rank documents by fuzzy match between the (normalized) query and doc title.
     """
-    q = (raw_q or "").lower().strip()
-    if not q:
+    qn = _norm_title_text(raw_q)
+    if not qn:
         return []
     hits = []
     for d in docs:
-        title = (d.get("title") or "").lower()
-        # Use a robust combo of token_set and partial
-        s = max(fuzz.token_set_ratio(q, title), fuzz.partial_ratio(q, title)) / 100.0
+        tn = _norm_title_text(d.get("title") or "")
+        s = max(fuzz.token_set_ratio(qn, tn), fuzz.partial_ratio(qn, tn)) / 100.0
         if s >= min_score:
             hits.append((s, d))
     hits.sort(key=lambda x: x[0], reverse=True)
@@ -278,8 +279,64 @@ def _title_hits_general(raw_q: str, docs, top_n=5, min_score=0.80):
             "text": snippet,
             "title": d.get("title") or "",
             "url": d.get("file_url") or "",
-            # give a small bonus so title matches are ordered before content hits
-            "score": s + 0.25
+            "score": s + 0.25  # small bonus so titles outrank content
+        })
+    return out
+
+# --- Name-based title hits (no hardcoded connectors; typo-tolerant) ---
+def _title_hits_for_names(raw_q: str, docs, top_n=5, min_each=0.70, min_avg=0.78):
+    """
+    If the query has 2+ meaningful tokens (after removing dynamic stopwords),
+    boost titles where (at least) the best two tokens match the title well.
+    Falls back to 'all tokens' if stopword removal leaves <2 tokens.
+    """
+    st = build_corpus_stats()
+    toks = [t for t in tokenize(raw_q) if t not in st["stop"]]
+    if len(toks) < 2:
+        toks = tokenize(raw_q)
+    # de-dup while preserving order
+    seen = set()
+    q_tokens = [t for t in toks if not (t in seen or seen.add(t))]
+    if len(q_tokens) < 2:
+        return []
+
+    hits = []
+    for d in docs:
+        title_tokens = tokenize(d.get("title") or "")
+        if not title_tokens:
+            continue
+
+        # best score in title for each query token
+        per_tok = []
+        for qt in q_tokens:
+            best = 0.0
+            for tt in title_tokens:
+                best = max(best, fuzz.partial_ratio(qt, tt) / 100.0, fuzz.ratio(qt, tt) / 100.0)
+            per_tok.append(best)
+
+        # consider the top 2–3 token matches to compute average
+        good_sorted = sorted(per_tok, reverse=True)
+        topk = good_sorted[:max(2, min(3, len(good_sorted)))]
+        if len([s for s in topk if s >= min_each]) >= 2:
+            avg_s = sum(topk) / len(topk)
+            if avg_s >= min_avg:
+                hits.append((avg_s + 0.28, d))  # priority bump slightly > general title
+
+    hits.sort(key=lambda x: x[0], reverse=True)
+
+    out = []
+    for s, d in hits[:top_n]:
+        text = (d.get("content") or "").strip()
+        chunk = split_paragraphs(text)
+        if not chunk:
+            ss = split_sentences(text)
+            chunk = ss[:1] if ss else []
+        snippet = (chunk[0] if chunk else "")[:400]
+        out.append({
+            "text": snippet,
+            "title": d.get("title") or "",
+            "url": d.get("file_url") or "",
+            "score": s
         })
     return out
 
@@ -298,14 +355,15 @@ def suggest():
     if dropped > 0 and not tail_tokens:
         return jsonify({"q": q, "suggestions": []})
 
+    # cleaned query without leading stopwords
     q_base = " ".join(tail_tokens) if tail_tokens else q
     docs = load_docs_cache()
 
-    # Title booster for "X vs Y" queries
+    # Title boosters
     vs_suggestions = _title_hits_for_vs(q_base, docs, top_n=1)
-
-    # NEW: general title matches (high fuzzy to any title)
-    title_suggestions = _title_hits_general(q_base, docs, top_n=k, min_score=0.80)
+    name_title_suggestions = _title_hits_for_names(q_base, docs, top_n=k)
+    # Slightly lower threshold via caller so "and" vs "vs" doesn't miss
+    title_suggestions = _title_hits_general(q_base, docs, top_n=k, min_score=0.78)
 
     # Project into corpus space
     q_proj = project_query_to_corpus(q_base)
@@ -332,10 +390,10 @@ def suggest():
     # Dynamic thresholds: block OOD single tokens (e.g., "batman")
     if out_of_corpus and len(content_terms) <= 2:
         logging.info("Suggest blocked by OOD guard: q=%r key_q=%r coverage=%.2f", q, key_q, coverage)
-        # still return any title hits we found
+        # still return title hits we found (VS + name-based + general)
         merged = []
         seen = set()
-        for s in (vs_suggestions + title_suggestions):
+        for s in (vs_suggestions + name_title_suggestions + title_suggestions):
             url = s.get("url")
             if url in seen:
                 continue
@@ -414,10 +472,10 @@ def suggest():
 
     body_suggestions = sorted(best_by_doc.values(), key=lambda s: s["score"], reverse=True)[:k]
 
-    # Merge with title priority: VS title hits -> general title hits -> content
+    # Merge with title priority: VS title hits -> name-based title hits -> general title hits -> content
     seen = set()
     merged = []
-    for s in (vs_suggestions + title_suggestions + body_suggestions):
+    for s in (vs_suggestions + name_title_suggestions + title_suggestions + body_suggestions):
         url = s.get("url")
         if url in seen:
             continue
