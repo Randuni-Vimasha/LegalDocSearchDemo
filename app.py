@@ -140,6 +140,7 @@ def _proj_accept(tok: str, vtok: str):
         ok = sim >= 0.90
     return ok, sim
 
+#map each query token to a close form in vocab
 #if token length ≥ 4 and first/last chars don’t match, reject early.
 def project_query_to_corpus(raw_query: str) -> str:
     """Map tokens to close forms that actually exist in your corpus."""
@@ -172,6 +173,7 @@ def project_query_to_corpus(raw_query: str) -> str:
         projected.append(best if best else tok)
 
     return " ".join(projected)
+
 #measures how many content tokens from query are found in vocab
 def corpus_coverage_ratio(query: str) -> float:
     st = build_corpus_stats()
@@ -180,6 +182,7 @@ def corpus_coverage_ratio(query: str) -> float:
         return 0.0
     hits = sum(1 for t in q_tokens if t in st["vocab"])
     return hits / len(q_tokens)
+#returns fraction of remaining tokens in vocab.
 
 def doc_hybrid_score(q, q_emb, d):
     """Doc-level score for preselecting docs."""
@@ -212,6 +215,7 @@ def _strip_leading_stopwords(tokens):
 VS_RE = re.compile(r"\b([a-z][a-z\-]{2,})\s+v(?:s\.?)?\s+([a-z][a-z\-]{1,})\b")
 
 #title
+#vs_re matches patterns like sm vs jon
 def _title_hits_for_vs(raw_q: str, docs, top_n=1):
     m = VS_RE.search((raw_q or '').lower())
     if not m:
@@ -244,6 +248,41 @@ def _title_hits_for_vs(raw_q: str, docs, top_n=1):
         })
     return suggestions
 
+# ---  General title-priority hits (not only "X vs Y") ---
+def _title_hits_general(raw_q: str, docs, top_n=5, min_score=0.80):
+    """
+    Rank documents by fuzzy match between the whole query and the doc title.
+    Returns top_n suggestions for titles that score >= min_score.
+    """
+    q = (raw_q or "").lower().strip()
+    if not q:
+        return []
+    hits = []
+    for d in docs:
+        title = (d.get("title") or "").lower()
+        # Use a robust combo of token_set and partial
+        s = max(fuzz.token_set_ratio(q, title), fuzz.partial_ratio(q, title)) / 100.0
+        if s >= min_score:
+            hits.append((s, d))
+    hits.sort(key=lambda x: x[0], reverse=True)
+
+    out = []
+    for s, d in hits[:top_n]:
+        text = (d.get("content") or "").strip()
+        chunk = split_paragraphs(text)
+        if not chunk:
+            ss = split_sentences(text)
+            chunk = ss[:1] if ss else []
+        snippet = (chunk[0] if chunk else "")[:400]
+        out.append({
+            "text": snippet,
+            "title": d.get("title") or "",
+            "url": d.get("file_url") or "",
+            # give a small bonus so title matches are ordered before content hits
+            "score": s + 0.25
+        })
+    return out
+
 #  /suggest 
 @app.route("/suggest", methods=["GET"])
 def suggest():
@@ -265,17 +304,26 @@ def suggest():
     # Title booster for "X vs Y" queries
     vs_suggestions = _title_hits_for_vs(q_base, docs, top_n=1)
 
+    # NEW: general title matches (high fuzzy to any title)
+    title_suggestions = _title_hits_general(q_base, docs, top_n=k, min_score=0.80)
+
     # Project into corpus space
     q_proj = project_query_to_corpus(q_base)
 
     # Focus on content terms (drop dynamic stopwords)
     st = build_corpus_stats()
-    content_terms = [t for t in tokenize(q_proj) if t not in st["stop"]]
+
+    # keep only tokens that are NOT stopwords AND in vocab
+    content_terms = [t for t in tokenize(q_proj) if (t not in st["stop"] and t in st["vocab"])]
     key_q = " ".join(content_terms) if content_terms else q_proj.lower()
 
     # original-content key (keeps plurals like "bulls/bullocks")
-    orig_content_terms = [t for t in tokenize(q_base) if t not in st["stop"]]
+    orig_content_terms = [t for t in tokenize(q_base) if (t not in st["stop"] and t in st["vocab"])]
     orig_key_q = " ".join(orig_content_terms) if orig_content_terms else q_base.lower()
+
+    # vocab-only fallback key (even if stopwords), for forgiving fuzzy
+    vocab_only_terms = [t for t in tokenize(q_proj) if t in st["vocab"]]
+    vocab_key = " ".join(vocab_only_terms) if vocab_only_terms else key_q
 
     # Coverage check; BUT do not block if we already have a strong VS title hit
     coverage = corpus_coverage_ratio(q_proj) if len(q_proj) > 3 else 1.0
@@ -284,7 +332,18 @@ def suggest():
     # Dynamic thresholds: block OOD single tokens (e.g., "batman")
     if out_of_corpus and len(content_terms) <= 2:
         logging.info("Suggest blocked by OOD guard: q=%r key_q=%r coverage=%.2f", q, key_q, coverage)
-        return jsonify({"q": q, "suggestions": vs_suggestions[:k]})
+        # still return any title hits we found
+        merged = []
+        seen = set()
+        for s in (vs_suggestions + title_suggestions):
+            url = s.get("url")
+            if url in seen:
+                continue
+            seen.add(url)
+            merged.append(s)
+            if len(merged) >= k:
+                break
+        return jsonify({"q": q, "suggestions": merged})
 
     if out_of_corpus and len(content_terms) <= 3:
         fuzzy_cut = 0.72
@@ -322,12 +381,19 @@ def suggest():
 
         for chunk in chunks:
             chunk_lc = chunk.lower()
-            # use the best fuzzy score across projected and original-content keys
+            # include vocab_key as a fallback in fuzzy
             f = max(
                 fuzzy_score(key_q,      chunk_lc),
-                fuzzy_score(orig_key_q, chunk_lc)
+                fuzzy_score(orig_key_q, chunk_lc),
+                fuzzy_score(vocab_key,  chunk_lc),
             )
-            if f < fuzzy_cut:
+
+            # relax fuzzy if doc is semantically close at the doc level
+            local_cut = fuzzy_cut
+            if q_emb is not None and d_cos >= 0.20:
+                local_cut = min(local_cut, 0.60)
+
+            if f < local_cut:
                 continue
             if q_emb is not None and d_cos < doc_cos_cut:
                 continue
@@ -348,10 +414,10 @@ def suggest():
 
     body_suggestions = sorted(best_by_doc.values(), key=lambda s: s["score"], reverse=True)[:k]
 
-    # Merge VS-title hits (if any) at the top, de-dup by URL
+    # Merge with title priority: VS title hits -> general title hits -> content
     seen = set()
     merged = []
-    for s in vs_suggestions + body_suggestions:
+    for s in (vs_suggestions + title_suggestions + body_suggestions):
         url = s.get("url")
         if url in seen:
             continue
