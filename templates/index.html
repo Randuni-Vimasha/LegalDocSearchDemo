@@ -6,24 +6,73 @@
   <title>Legal Document Search</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
   <style>
-    /* suggestions dropdown sits under the input */
-    #suggestions { z-index: 1050; max-height: 320px; overflow:auto; }
-    #suggestions .list-group-item { cursor: pointer; }
-    mark { padding: 0 .1rem; }
+    :root{
+      --card-border:#e9ecf2;
+      --ink-1:#0b1324;
+      --ink-2:#4a5568;
+      --muted:#8b95a7;
+      --bg:#f7f8fb;
+      --chip:#fff;
+      --chip-border:#d9dfeb;
+      --mark-bg:#fff3b0;
+    }
+    body { background: var(--bg); color: var(--ink-1); }
+    .app-title { font-weight: 800; letter-spacing: .2px; }
+    .search-card { border: 1px solid var(--card-border); border-radius: 16px; }
+    .search-input { padding: .9rem 1rem; font-size: 1.05rem; }
+    .toolbar { gap:.5rem }
+    .pill { border: 1px solid var(--chip-border); background:var(--chip); border-radius: 999px; padding: .25rem .6rem; cursor: pointer; }
+    .pill + .pill { margin-left: .4rem; }
+    #suggestions { z-index: 1050; max-height: 360px; overflow:auto; border-radius: 12px; }
+    #suggestions .list-group-item { cursor: pointer; border: 0; border-bottom: 1px solid #f0f2f6; }
+    #suggestions .list-group-item:last-child { border-bottom: 0; }
+    .suggest-title { font-weight: 600; color:var(--ink-1); }
+    .suggest-snippet { color: var(--ink-2); }
+    mark { padding: 0 .14rem; border-radius: 3px; background: var(--mark-bg); }
+    .status { min-height: 40px; }
+    .empty-card { border-radius: 12px; border: 1px dashed #e0e5ef; background: #fff; }
+    .btn-ghost { background:#fff; border:1px solid var(--card-border); }
   </style>
 </head>
-<body class="bg-light">
-  <div class="container py-5">
-    <h1 class="mb-4">Legal Document Search</h1>
+<body>
+  <div class="container py-5" style="max-width: 860px;">
+    <h1 class="app-title mb-4">Legal Document Search</h1>
 
-    <div class="card p-3 shadow-sm">
-      <div class="mb-3 position-relative">
-        <label class="form-label">Enter your query</label>
-        <input id="q" class="form-control" placeholder="type your text here"/>
-        <!-- realtime suggestions -->
-        <div id="suggestions" class="list-group position-absolute w-100 shadow-sm d-none"></div>
+    <div class="card search-card p-3 shadow-sm">
+      <div class="mb-2 small text-muted">
+        Type a case title, party name, or a sentence from a judgment.
+      </div>
+
+      <!-- Input + refresh -->
+      <div class="d-flex toolbar mb-2">
+        <input id="q" class="form-control search-input" placeholder="e.g. Type your text here" />
+        <button id="refresh" class="btn btn-ghost px-3" title="Clear search">
+          &#x21bb; Refresh
+        </button>
+      </div>
+
+      <!-- example chips -->
+      <!-- <div class="d-flex align-items-center gap-2 mb-3">
+        <span class="small text-muted me-1">Try:</span>
+        <span class="pill small example">nanayakkara</span>
+        <span class="pill small example">Gunasena v Bandarathilake</span>
+        <span class="pill small example">animal cruelty bulls bullocks</span>
+      </div>  -->
+
+      <!-- Status line (warnings / info) -->
+      <div id="status" class="status"></div>
+
+      <!-- realtime suggestions -->
+      <div class="position-relative">
+        <div id="suggestions" class="list-group position-absolute w-100 shadow-sm d-none bg-white"></div>
       </div>
     </div>
+
+     <div id="empty" class="empty-card mt-3 p-3 d-none">
+      <div class="small text-muted">
+        No results yet. Start typing at least 2 characters.
+      </div>
+    </div> 
   </div>
 
 <script>
@@ -31,41 +80,111 @@
   const DEBOUNCE_MS = 200;
 
   function debounce(fn, ms) { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
-  function escapeHTML(s){ return s.replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
-  function highlight(text, query){
-    if(!query) return escapeHTML(text);
-    const escQ = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("(" + escQ + ")", "ig");
-    return escapeHTML(text).replace(re, "<mark>$1</mark>");
+  function escapeHTML(s){ return (s??"").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
+
+  // Token-based highlighting (ignores common stopwords; simple plural handling)
+  const TOKEN_RE = /[a-z][a-z\-]{2,}/g;
+  const STOP = new Set(["the","a","an","of","and","or","if","to","in","on","for","with","by",
+                        "is","are","be","was","were","at","from","as","that","this","these","those","it","about"]);
+
+  function tokenizeQuery(q){
+    const toks = ((q||"").toLowerCase().match(TOKEN_RE) || []).filter(t => !STOP.has(t));
+    return [...new Set(toks)].sort((a,b)=>b.length-a.length);
   }
+
+  function highlightTokens(text, tokens){
+    if(!text || !tokens?.length) return escapeHTML(text || "");
+    const parts = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    // plural-ish end: (s|es)?; word boundaries for clean matches
+    const re = new RegExp(`\\b(${parts.join("|")})(?:s|es)?\\b`, "gi");
+    let out = "", last = 0, raw = text || "", m;
+    while((m = re.exec(raw)) !== null){
+      out += escapeHTML(raw.slice(last, m.index));
+      out += "<mark>" + escapeHTML(m[0]) + "</mark>";
+      last = re.lastIndex;
+    }
+    out += escapeHTML(raw.slice(last));
+    return out;
+  }
+
   function hideSuggestions(){
     const box = document.getElementById("suggestions");
     box.classList.add("d-none");
     box.innerHTML = "";
   }
+  function showSuggestionsBox(){
+    const box = document.getElementById("suggestions");
+    box.classList.remove("d-none");
+  }
+  function setStatus(message, type="warning"){
+    const el = document.getElementById("status");
+    if(!message){ el.innerHTML = ""; return; }
+    const cls = type === "danger" ? "alert-danger"
+              : type === "info"   ? "alert-info"
+              : type === "success"? "alert-success"
+              : "alert-warning";
+    el.innerHTML = `<div class="alert ${cls} py-2 px-3 mb-0 small">${escapeHTML(message)}</div>`;
+  }
+  function clearStatus(){ setStatus(""); }
+  function showEmptyInfo(show){
+    document.getElementById("empty").classList.toggle("d-none", !show);
+  }
 
-  // ---------- realtime suggestions ----------
+  // ---------- suggestions ----------
   async function fetchSuggestions(q){
-    if(q.length < 2){ hideSuggestions(); return; }
+    const box = document.getElementById("suggestions");
+
+    if(q.length < 2){
+      hideSuggestions();
+      clearStatus();
+      showEmptyInfo(true);
+      return;
+    }
+
+    // loading state
+    showSuggestionsBox();
+    box.innerHTML = `
+      <div class="d-flex align-items-center justify-content-center py-3">
+        <div class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></div>
+        <div class="small text-muted">Searching…</div>
+      </div>`;
+
     try{
       const r = await fetch("/suggest?" + new URLSearchParams({ q, k: 8 }));
       const data = await r.json();
-      renderSuggestions(q, data.suggestions || []);
-    }catch(e){ hideSuggestions(); }
+      const items = data.suggestions || [];
+
+      // If nothing came back for a sufficiently informative query, flag as "not relevant"
+      if(items.length === 0 && q.trim().length >= 3){
+        hideSuggestions();
+        setStatus("That doesn’t look like a relevant legal keyword. Try a party name, case title, or a phrase from a judgment.", "warning");
+        showEmptyInfo(false);
+        return;
+      }
+
+      clearStatus();
+      showEmptyInfo(false);
+      renderSuggestions(q, items);
+
+    }catch(e){
+      hideSuggestions();
+      setStatus("Couldn’t reach the server. Please check your connection and try again.", "danger");
+    }
   }
   const debouncedSuggest = debounce(fetchSuggestions, DEBOUNCE_MS);
 
   function renderSuggestions(q, items){
     const box = document.getElementById("suggestions");
     if(!items.length){ hideSuggestions(); return; }
+    const toks = tokenizeQuery(q);
+
     box.innerHTML = items.map(s => `
       <a href="#" class="list-group-item list-group-item-action"
-         data-text="${encodeURIComponent(s.text)}"
-         data-title="${encodeURIComponent(s.title)}"
+         data-text="${encodeURIComponent(s.text || "")}"
+         data-title="${encodeURIComponent(s.title || "")}"
          data-url="${s.url || ""}">
-        <div class="fw-semibold">${escapeHTML(s.title || "")}</div>
-        <!-- Clicking this sentence will NOT change the input -->
-        <div class="small text-muted use-sentence">${highlight(s.text || "", q)}</div>
+        <div class="suggest-title">${highlightTokens(s.title || "", toks)}</div>
+        <div class="small suggest-snippet use-sentence">${highlightTokens(s.text || "", toks)}</div>
         ${s.url ? `
           <button type="button"
                   class="btn btn-sm btn-outline-secondary mt-2 open-pdf"
@@ -74,35 +193,47 @@
           </button>` : ""}
       </a>
     `).join("");
-    box.classList.remove("d-none");
+    showSuggestionsBox();
   }
 
   // EVENTS
-  // Clicking a suggestion sentence: keep the user's query; just close the dropdown
+  // Keep results visible: do NOT auto-hide when clicking blank space anymore.
+  // (We intentionally removed the old document-level click handler.)
+
+  // Clicking inside a suggestion snippet just closes the dropdown (doesn't change the query)
   document.getElementById("suggestions").addEventListener("click", (e)=>{
-    if (e.target.closest(".open-pdf")) return;   // handled by button itself
+    if (e.target.closest(".open-pdf")) return;
     const sentenceEl = e.target.closest(".use-sentence");
     if (!sentenceEl) return;
     e.preventDefault();
-
-    //  copy snippet to clipboard instead of overwriting the input
-    // const item = e.target.closest(".list-group-item");
-    // const sentence = decodeURIComponent(item?.dataset?.text || "");
-    // navigator.clipboard?.writeText(sentence).catch(()=>{});
-
-    hideSuggestions(); // just close – do not modify #q.value
+    // keep query; simply close
+    hideSuggestions();
   });
 
-  // hide suggestions when clicking outside
-  document.addEventListener("click", (e)=>{
-    const q = document.getElementById("q");
-    const box = document.getElementById("suggestions");
-    if (e.target !== q && !box.contains(e.target)) hideSuggestions();
-  });
-
-  // wire up type-ahead only
+  // Input typing
   const qInput = document.getElementById("q");
   qInput.addEventListener("input", e => debouncedSuggest(e.target.value));
+
+  // Refresh button: clear query + results explicitly
+  document.getElementById("refresh").addEventListener("click", ()=>{
+    qInput.value = "";
+    hideSuggestions();
+    clearStatus();
+    showEmptyInfo(true);
+    qInput.focus();
+  });
+
+  // Example chips
+  document.querySelectorAll(".example").forEach(p => {
+    p.addEventListener("click", () => {
+      qInput.value = p.textContent.trim();
+      qInput.focus();
+      debouncedSuggest(qInput.value);
+    });
+  });
+
+  // initial state
+  showEmptyInfo(true);
 </script>
 </body>
 </html>

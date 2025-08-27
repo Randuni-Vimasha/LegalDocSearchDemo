@@ -30,6 +30,7 @@ oa = OpenAI(api_key=OPENAI_API_KEY)
 
 # helpers 
 TOKEN_RE = re.compile(r"[a-z][a-z\-]{2,}")  # tokens >= 3 letters
+WORD_BOUNDARY_CACHE = {}
 
 def tokenize(text: str):
     return TOKEN_RE.findall((text or "").lower())
@@ -42,9 +43,32 @@ def _unit(v):
     n = np.linalg.norm(arr)
     return (arr / (n + 1e-12)).tolist()
 
+def _word_re(tok: str):
+    r = WORD_BOUNDARY_CACHE.get(tok)
+    if r is None:
+        r = re.compile(rf"\b{re.escape(tok)}\b")
+        WORD_BOUNDARY_CACHE[tok] = r
+    return r
+
+def token_present(text_lc: str, tok: str) -> bool:
+    return bool(_word_re(tok).search(text_lc or ""))
+
 def fuzzy_score(a: str, b: str) -> float:
-    """Safer than partial_ratio for full queries."""
-    return fuzz.token_set_ratio(a, b) / 100.0
+    """
+    Robust fuzzy similarity.
+    For single-token queries, literal word presence inside a long text counts as a perfect hit.
+    """
+    a = (a or "").lower()
+    b = (b or "").lower()
+    a_toks = tokenize(a)
+    if len(a_toks) == 1:
+        if token_present(b, a_toks[0]):
+            return 1.0
+    return max(
+        fuzz.partial_ratio(a, b),
+        fuzz.token_set_ratio(a, b),
+        fuzz.ratio(a, b),
+    ) / 100.0
 
 def get_embedding(text, model="text-embedding-ada-002"):
     emb = oa.embeddings.create(model=model, input=text).data[0].embedding
@@ -110,8 +134,30 @@ def build_corpus_stats():
     vocab = {t for t, c in df.items() if c >= 1 and t not in stop}
     return {"vocab": vocab, "stop": stop, "df": df}
 
+# DF presence-based coverage 
+LEADING_STOPWORDS = {
+    "the","a","an","of","and","or","if","to","in","on","for","with","by",
+    "is","are","be","was","were","at","from","as","that","this","these","those","it","about"
+}
+
+def corpus_presence_ratio(query: str) -> float:
+    """
+    Presence by DF: a token 'counts' if DF>=1 anywhere in the corpus.
+    Ignore only leading trivial stopwords (keep dynamic ones eligible).
+    """
+    st = build_corpus_stats()
+    toks = tokenize(query)
+    # drop only leading trivial stopwords, not dynamic ones
+    i = 0
+    while i < len(toks) and toks[i] in LEADING_STOPWORDS:
+        i += 1
+    toks = toks[i:]
+    if not toks:
+        return 0.0
+    hits = sum(1 for t in toks if st["df"].get(t, 0) >= 1)
+    return hits / len(toks)
+
 # --- light morphology + typo/prefix snap to vocab ---
-#safe singularization
 def _morph_to_vocab(tok: str, vocab: set):
     if tok.endswith("ies") and len(tok) > 4 and (tok[:-3] + "y") in vocab:
         return tok[:-3] + "y"
@@ -123,8 +169,6 @@ def _morph_to_vocab(tok: str, vocab: set):
         return tok[:-1]
     return tok
 
-#length aware typo check
-#when gives a user tok decide whether vtok is acceptable
 def _proj_accept(tok: str, vtok: str):
     L = max(len(tok), len(vtok))
     sim = distance.Levenshtein.normalized_similarity(tok, vtok)
@@ -140,10 +184,7 @@ def _proj_accept(tok: str, vtok: str):
         ok = sim >= 0.90
     return ok, sim
 
-#map each query token to a close form in vocab
-#if token length ≥ 4 and first/last chars don’t match, reject early.
 def project_query_to_corpus(raw_query: str) -> str:
-    """Map tokens to close forms that actually exist in your corpus."""
     st = build_corpus_stats()
     vocab, df = st["vocab"], st["df"]
     q_tokens = tokenize(raw_query)
@@ -174,7 +215,6 @@ def project_query_to_corpus(raw_query: str) -> str:
 
     return " ".join(projected)
 
-#measures how many content tokens from query are found in vocab
 def corpus_coverage_ratio(query: str) -> float:
     st = build_corpus_stats()
     q_tokens = [t for t in tokenize(query) if t not in st["stop"]]
@@ -182,10 +222,8 @@ def corpus_coverage_ratio(query: str) -> float:
         return 0.0
     hits = sum(1 for t in q_tokens if t in st["vocab"])
     return hits / len(q_tokens)
-#returns fraction of remaining tokens in vocab.
 
-def doc_hybrid_score(q, q_emb, d):
-    """Doc-level score for preselecting docs."""
+def doc_hybrid_score(q, q_emb, d, name_like=False, q_tokens=None):
     title = (d.get("title") or "").lower()
     content = (d.get("content") or "").lower()
     emb = d.get("embedding")
@@ -193,13 +231,20 @@ def doc_hybrid_score(q, q_emb, d):
     cos = float(cosine_similarity([q_emb], [emb])[0][0]) if (q_emb is not None and emb is not None) else 0.0
     f_title = fuzzy_score(q.lower(), title)
     f_cont  = fuzzy_score(q.lower(), content)
-    return 0.7 * cos + 0.15 * f_title + 0.15 * f_cont, cos
 
-# --- Leading stopword gate ---
-LEADING_STOPWORDS = {
-    "the","a","an","of","and","or","if","to","in","on","for","with","by",
-    "is","are","be","was","were","at","from","as","that","this","these","those","it","about"
-}
+    pres = 0.0
+    if name_like and q_tokens:
+        hits = 0
+        for t in q_tokens:
+            if token_present(title, t) or token_present(content, t):
+                hits += 1
+        if hits:
+            pres = min(1.0, hits / max(1, len(q_tokens)))
+
+    return (0.70 * cos + 0.15 * f_title + 0.15 * f_cont + 0.18 * pres), cos
+#pres-checks how many of the query tokens literally appear as whole words in the doc's title or content
+
+# --- Leading stopword gate (UI typing nicety) ---
 _WORDS_ANY = re.compile(r"[a-z]+")
 
 def _tokens_all(s: str):
@@ -209,7 +254,7 @@ def _strip_leading_stopwords(tokens):
     i = 0
     while i < len(tokens) and tokens[i] in LEADING_STOPWORDS:
         i += 1
-    return tokens[i:], i  # (tail, dropped)
+    return tokens[i:], i
 
 # --- "X vs Y" title booster ---
 VS_RE = re.compile(r"\b([a-z][a-z\-]{2,})\s+v(?:s\.?)?\s+([a-z][a-z\-]{1,})\b")
@@ -246,16 +291,10 @@ def _title_hits_for_vs(raw_q: str, docs, top_n=1):
         })
     return suggestions
 
-# --- utility for normalized title text ---
 def _norm_title_text(s: str) -> str:
-    # tokenize removes punctuation & ".pdf" effects; lowercased already
     return " ".join(tokenize(s or ""))
 
-# --- General title-priority hits (robust, normalized) ---
 def _title_hits_general(raw_q: str, docs, top_n=5, min_score=0.80):
-    """
-    Rank documents by fuzzy match between the (normalized) query and doc title.
-    """
     qn = _norm_title_text(raw_q)
     if not qn:
         return []
@@ -279,22 +318,15 @@ def _title_hits_general(raw_q: str, docs, top_n=5, min_score=0.80):
             "text": snippet,
             "title": d.get("title") or "",
             "url": d.get("file_url") or "",
-            "score": s + 0.25  # small bonus so titles outrank content
+            "score": s + 0.25
         })
     return out
 
-# --- Name-based title hits (no hardcoded connectors; typo-tolerant) ---
 def _title_hits_for_names(raw_q: str, docs, top_n=5, min_each=0.70, min_avg=0.78):
-    """
-    If the query has 2+ meaningful tokens (after removing dynamic stopwords),
-    boost titles where (at least) the best two tokens match the title well.
-    Falls back to 'all tokens' if stopword removal leaves <2 tokens.
-    """
     st = build_corpus_stats()
     toks = [t for t in tokenize(raw_q) if t not in st["stop"]]
     if len(toks) < 2:
         toks = tokenize(raw_q)
-    # de-dup while preserving order
     seen = set()
     q_tokens = [t for t in toks if not (t in seen or seen.add(t))]
     if len(q_tokens) < 2:
@@ -305,22 +337,18 @@ def _title_hits_for_names(raw_q: str, docs, top_n=5, min_each=0.70, min_avg=0.78
         title_tokens = tokenize(d.get("title") or "")
         if not title_tokens:
             continue
-
-        # best score in title for each query token
         per_tok = []
         for qt in q_tokens:
             best = 0.0
             for tt in title_tokens:
                 best = max(best, fuzz.partial_ratio(qt, tt) / 100.0, fuzz.ratio(qt, tt) / 100.0)
             per_tok.append(best)
-
-        # consider the top 2–3 token matches to compute average
         good_sorted = sorted(per_tok, reverse=True)
         topk = good_sorted[:max(2, min(3, len(good_sorted)))]
         if len([s for s in topk if s >= min_each]) >= 2:
             avg_s = sum(topk) / len(topk)
             if avg_s >= min_avg:
-                hits.append((avg_s + 0.28, d))  # priority bump slightly > general title
+                hits.append((avg_s + 0.28, d))
 
     hits.sort(key=lambda x: x[0], reverse=True)
 
@@ -349,68 +377,62 @@ def suggest():
     if len(q) < 2:
         return jsonify({"q": q, "suggestions": []})
 
-    # If only leading stopwords so far, wait
+    # typing nicety: ignore leading trivial stopwords only
     toks_all = _tokens_all(q)
-    tail_tokens, dropped = _strip_leading_stopwords(toks_all)
-    if dropped > 0 and not tail_tokens:
+    i = 0
+    while i < len(toks_all) and toks_all[i] in LEADING_STOPWORDS:
+        i += 1
+    tail_tokens = toks_all[i:]
+    if i > 0 and not tail_tokens:
         return jsonify({"q": q, "suggestions": []})
 
-    # cleaned query without leading stopwords
     q_base = " ".join(tail_tokens) if tail_tokens else q
     docs = load_docs_cache()
 
-    # Title boosters
+    # Title boosters are still computed for guards, but not used to pre-bias results
     vs_suggestions = _title_hits_for_vs(q_base, docs, top_n=1)
-    name_title_suggestions = _title_hits_for_names(q_base, docs, top_n=k)
-    # Slightly lower threshold via caller so "and" vs "vs" doesn't miss
-    title_suggestions = _title_hits_general(q_base, docs, top_n=k, min_score=0.78)
+    # (we don't merge name/title lists anymore)
 
     # Project into corpus space
     q_proj = project_query_to_corpus(q_base)
 
-    # Focus on content terms (drop dynamic stopwords)
+    # Stats
     st = build_corpus_stats()
-
-    # keep only tokens that are NOT stopwords AND in vocab
     content_terms = [t for t in tokenize(q_proj) if (t not in st["stop"] and t in st["vocab"])]
     key_q = " ".join(content_terms) if content_terms else q_proj.lower()
 
-    # original-content key (keeps plurals like "bulls/bullocks")
     orig_content_terms = [t for t in tokenize(q_base) if (t not in st["stop"] and t in st["vocab"])]
     orig_key_q = " ".join(orig_content_terms) if orig_content_terms else q_base.lower()
 
-    # vocab-only fallback key (even if stopwords), for forgiving fuzzy
     vocab_only_terms = [t for t in tokenize(q_proj) if t in st["vocab"]]
     vocab_key = " ".join(vocab_only_terms) if vocab_only_terms else key_q
 
-    # Coverage check; BUT do not block if we already have a strong VS title hit
+    # Coverage + presence
     coverage = corpus_coverage_ratio(q_proj) if len(q_proj) > 3 else 1.0
     out_of_corpus = (coverage == 0.0 and not vs_suggestions)
 
-    # Dynamic thresholds: block OOD single tokens (e.g., "batman")
-    if out_of_corpus and len(content_terms) <= 2:
-        logging.info("Suggest blocked by OOD guard: q=%r key_q=%r coverage=%.2f", q, key_q, coverage)
-        # still return title hits we found (VS + name-based + general)
-        merged = []
-        seen = set()
-        for s in (vs_suggestions + name_title_suggestions + title_suggestions):
-            url = s.get("url")
-            if url in seen:
-                continue
-            seen.add(url)
-            merged.append(s)
-            if len(merged) >= k:
-                break
-        return jsonify({"q": q, "suggestions": merged})
+    q_tokens_all = tokenize(q_base)
+    name_like = (len(q_tokens_all) <= 3)
 
+    # Hard OOD block for short queries with zero DF presence (keeps Batman/Superman out)
+    if q_tokens_all:
+        presence = corpus_presence_ratio(q_proj)
+        if presence == 0.0 and name_like and not vs_suggestions:
+            logging.info("Suggest blocked by DF presence guard: q=%r tokens=%r", q, q_tokens_all)
+            return jsonify({"q": q, "suggestions": []})
+
+    # thresholds 
     if out_of_corpus and len(content_terms) <= 3:
-        fuzzy_cut = 0.72
+        fuzzy_cut = 0.72  # min fuzzy match score a snippet must reach to be accepted
         doc_cos_cut = 0.18
     else:
         fuzzy_cut = 0.80 if out_of_corpus else 0.70
         doc_cos_cut = 0.30 if out_of_corpus else 0.15
 
-    # Embed: choose the richer of projected vs original-content keys
+    if name_like:
+        doc_cos_cut = min(doc_cos_cut, 0.05)
+
+    # Embed
     q_eff = key_q if len(key_q) >= len(orig_key_q) else orig_key_q
     q_emb = None
     if len(q_eff) >= 4:
@@ -419,74 +441,132 @@ def suggest():
         except Exception:
             q_emb = None
 
-    # Preselect candidate docs
+    # Preselect using your hybrid doc score (keeps behavior the same up to here)
     scored = []
     for d in docs:
-        total, cos = doc_hybrid_score(q_eff, q_emb, d)
+        total, cos = doc_hybrid_score(q_eff, q_emb, d, name_like=name_like, q_tokens=q_tokens_all)
         scored.append((total, cos, d))
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # One best snippet per document
-    best_by_doc = {}
-    for total, d_cos, d in scored[:DOC_TOP_N]:
+    # ---------- Unified scoring: pick the stronger of Title vs Content for each doc ----------
+        # ---------- Unified scoring: pick the stronger of Title vs Content for each doc ----------
+    candidates = []
+    qn = _norm_title_text(q_base)
+    long_query = (len(tokenize(q_base)) >= 6) or (len(q_base) >= 30)
+    q_lc = q_base.lower()
+
+    # anchor terms = projected non-stop vocabulary tokens (strongest hints from the query)
+    anchor_terms = [t for t in content_terms if len(t) >= 4]
+    anchor_terms = anchor_terms[:6]  # keep it tight
+
+    def _count_hits(text_lc: str, toks: list[str]) -> int:
+        return sum(1 for t in toks if token_present(text_lc, t))
+
+    pool_size = max(DOC_TOP_N * 3, 30)
+    for total, d_cos, d in scored[:pool_size]:
+        title = (d.get("title") or "")
+        title_lc = title.lower()
+
+        # Title similarity (normalized)
+        title_f = fuzzy_score(qn, _norm_title_text(title))
+        title_exact = False
+        if q_tokens_all:
+            tok_hits = sum(1 for t in q_tokens_all if token_present(title_lc, t))
+            title_exact = (tok_hits >= max(1, len(q_tokens_all) - 1))
+        if VS_RE.search(q_base.lower()):
+            title_exact = title_exact or (title_f >= 0.90)
+
+        # Content: find best snippet
         text = d.get("content") or ""
         chunks = split_paragraphs(text)
         if len(chunks) < 2:
             chunks = split_sentences(text)
 
-        best_chunk = None
-        best_score = -1.0
+        best_chunk = ""
+        best_f = 0.0
+        exact_chunk = False
+        anchored_chunk = False
 
         for chunk in chunks:
             chunk_lc = chunk.lower()
-            # include vocab_key as a fallback in fuzzy
+
+            # literal hits on anchor terms (e.g., 'bulls', 'bullock')
+            hits_here = _count_hits(chunk_lc, anchor_terms)
+            if hits_here >= 1:
+                anchored_chunk = True
+
             f = max(
                 fuzzy_score(key_q,      chunk_lc),
                 fuzzy_score(orig_key_q, chunk_lc),
                 fuzzy_score(vocab_key,  chunk_lc),
             )
 
-            # relax fuzzy if doc is semantically close at the doc level
+            # exact long-phrase boost when present
+            if long_query and re.search(rf"\b{re.escape(q_lc)}\b", chunk_lc):
+                f = max(f, 0.99)
+                exact_chunk = True
+
             local_cut = fuzzy_cut
+            # if the document-level cosine is decent, be a little more lenient
             if q_emb is not None and d_cos >= 0.20:
                 local_cut = min(local_cut, 0.60)
+            # if we have an anchor hit in this chunk, relax a bit more
+            if anchored_chunk:
+                local_cut = min(local_cut, 0.65)
 
-            if f < local_cut:
-                continue
-            if q_emb is not None and d_cos < doc_cos_cut:
+            if f < local_cut and not exact_chunk:
                 continue
 
-            s = (0.6 * d_cos + 0.4 * f) if q_emb is not None else f
-            if s > best_score:
-                best_score = s
+            if f > best_f:
+                best_f = f
                 best_chunk = chunk
 
-        if best_chunk:
-            key = d.get("id") or d.get("title") or d.get("file_url")
-            best_by_doc[key] = {
-                "text": best_chunk,
+        # Choose stronger channel (title vs content)
+        channel_f = best_f
+        snippet = best_chunk
+        exact = exact_chunk
+
+        if title_f >= best_f:
+            channel_f = title_f
+            exact = exact or title_exact
+            if not snippet:
+                ss = split_paragraphs(text) or split_sentences(text)
+                snippet = ss[0] if ss else ""
+
+        # Final score: mostly similarity, backed by doc cosine
+        content_w = 0.5 if long_query else 0.4
+        score = (content_w * channel_f + (1 - content_w) * max(d_cos, 0.0))
+        if exact:
+            score += 0.12
+
+        # final gate: normally 0.78, but allow entries that have an anchor hit + reasonable cosine
+        base_gate = 0.78
+        if long_query:
+            base_gate -= 0.03  # a touch more forgiving for long queries
+
+        # did any anchor term appear in the chosen snippet?
+        anchored_final = _count_hits((snippet or "").lower(), anchor_terms) >= 1
+
+        passes_gate = (channel_f >= base_gate) or (anchored_final and d_cos >= 0.12)
+
+        if passes_gate:
+            candidates.append({
+                "text": (snippet or "")[:400],
                 "title": d.get("title") or "",
                 "url": d.get("file_url") or "",
-                "score": best_score
-            }
+                "score": score
+            })
 
-    body_suggestions = sorted(best_by_doc.values(), key=lambda s: s["score"], reverse=True)[:k]
+    # Sort best-first and truncate
+    merged = sorted(candidates, key=lambda x: x["score"], reverse=True)[:k]
 
-    # Merge with title priority: VS title hits -> name-based title hits -> general title hits -> content
-    seen = set()
-    merged = []
-    for s in (vs_suggestions + name_title_suggestions + title_suggestions + body_suggestions):
-        url = s.get("url")
-        if url in seen:
-            continue
-        seen.add(url)
-        merged.append(s)
-        if len(merged) >= k:
-            break
 
-    logging.info("Suggest q=%r base=%r proj=%r key=%r coverage=%.2f OOD=%s n=%d",
-                 q, q_base, q_proj, key_q, coverage, out_of_corpus, len(merged))
+    logging.info(
+        "Suggest q=%r base=%r proj=%r key=%r coverage=%.2f OOD=%s name_like=%s n=%d",
+        q, q_base, q_proj, key_q, coverage, out_of_corpus, name_like, len(merged)
+    )
     return jsonify({"q": q, "suggestions": merged})
+
 
 # ======= MAIN =======
 if __name__ == "__main__":
