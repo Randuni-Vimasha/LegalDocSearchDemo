@@ -29,7 +29,8 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 oa = OpenAI(api_key=OPENAI_API_KEY)
 
 # helpers 
-TOKEN_RE = re.compile(r"[a-z][a-z\-]{2,}")  # tokens >= 3 letters
+# NOTE: allow numbers and forms like 48(4) in tokens (fixes "section 32"/"section 839"/"48(4)")
+TOKEN_RE = re.compile(r"(?:[a-z][a-z\-]{2,}|\d+(?:\([0-9a-z]{1,3}\))?)", re.IGNORECASE)
 WORD_BOUNDARY_CACHE = {}
 
 def tokenize(text: str):
@@ -46,31 +47,98 @@ def _unit(v):
 def _word_re(tok: str):
     r = WORD_BOUNDARY_CACHE.get(tok)
     if r is None:
-        r = re.compile(rf"\b{re.escape(tok)}\b")
+        # Use custom non-word guards so tokens like "48(4)" match (plain \b fails at ')')
+        r = re.compile(rf"(?<![\w]){re.escape(tok)}(?![\w])")
         WORD_BOUNDARY_CACHE[tok] = r
     return r
 
 def token_present(text_lc: str, tok: str) -> bool:
     return bool(_word_re(tok).search(text_lc or ""))
 
+def token_near_present(text_lc: str, tok: str, thresh: float = 0.90) -> bool:
+    """
+    Typo-tolerant whole-token check (no substrings).
+    Only for alphabetic tokens with length >= 4 (avoid 'cat'→'application' noise).
+    """
+    if not tok.isalpha() or len(tok) <= 3:
+        return False
+    text_lc = (text_lc or "").lower()
+    for w in tokenize(text_lc):
+        if distance.Levenshtein.normalized_similarity(w, tok) >= thresh:
+            return True
+    return False
+
+# --- Exact "section NNN" handling ---
+SECTION_Q_RE = re.compile(r"\bsection\s+([0-9]+[a-z]?(?:\([0-9a-z]+\))?)\b", re.IGNORECASE)
+ 
+def extract_section_number(q: str) -> str | None:
+    """Return '412' or '412(4)' etc. from queries like 'section 412' (case-insensitive)."""
+    m = SECTION_Q_RE.search(q or "")
+    return m.group(1).lower() if m else None
+ 
+def has_section_phrase(text_lc: str, sec_no: str) -> bool:
+    """
+    True if text contains an exact 'section 412' (flex spaces) OR 's. 412' variant.
+    Uses token-safe boundaries to avoid substrings.
+    text_lc is expected to be lowercase.
+    """
+    if not text_lc or not sec_no:
+        return False
+    # Accept "section 412" and "s. 412"
+    patterns = [
+        rf"section\s*{re.escape(sec_no)}",
+        rf"s\.\s*{re.escape(sec_no)}",
+    ]
+    for pat in patterns:
+        # word-boundary equivalent: no \w just before/after the whole phrase
+        if re.search(rf"(?<![\w]){pat}(?![\w])", text_lc):
+            return True
+    return False
+
 def fuzzy_score(a: str, b: str) -> float:
     """
-    Robust fuzzy similarity.
-    For single-token queries, literal word presence inside a long text counts as a perfect hit.
+    Single-token queries:
+      - len <= 3: exact whole-word only (no substrings, no typos)
+      - len >= 4: exact -> 1.0, else near-token -> 0.95
+    Multi-token => normal fuzzy.
     """
     a = (a or "").lower()
     b = (b or "").lower()
     a_toks = tokenize(a)
+ 
     if len(a_toks) == 1:
-        if token_present(b, a_toks[0]):
+        t = a_toks[0]
+        L = len(t)
+        if token_present(b, t):
             return 1.0
+        if L >= 4 and token_near_present(b, t, thresh=0.90):
+            return 0.95
+        return 0.0
+ 
     return max(
         fuzz.partial_ratio(a, b),
         fuzz.token_set_ratio(a, b),
         fuzz.ratio(a, b),
     ) / 100.0
 
-def get_embedding(text, model="text-embedding-ada-002"):
+# def fuzzy_score(a: str, b: str) -> float:
+#     """
+#     Robust fuzzy similarity.
+#     For single-token queries, literal word presence inside a long text counts as a perfect hit.
+#     """
+#     a = (a or "").lower()
+#     b = (b or "").lower()
+#     a_toks = tokenize(a)
+#     if len(a_toks) == 1:
+#         if token_present(b, a_toks[0]):
+#             return 1.0
+#     return max(
+#         fuzz.partial_ratio(a, b),
+#         fuzz.token_set_ratio(a, b),
+#         fuzz.ratio(a, b),
+#     ) / 100.0
+
+def get_embedding(text, model="text-embedding-3-small"):
     emb = oa.embeddings.create(model=model, input=text).data[0].embedding
     return _unit(emb)
 
@@ -193,6 +261,11 @@ def project_query_to_corpus(raw_query: str) -> str:
 
     projected = []
     for tok in q_tokens:
+        # Keep numeric tokens (and forms like 48(4)) intact; do not morph/correct them
+        if tok.isdigit() or re.match(r'^\d+(?:\([0-9a-z]+\))?$', tok):
+            projected.append(tok)
+            continue
+
         mtok = _morph_to_vocab(tok, vocab)
         if mtok in vocab:
             projected.append(mtok)
@@ -245,7 +318,8 @@ def doc_hybrid_score(q, q_emb, d, name_like=False, q_tokens=None):
 #pres-checks how many of the query tokens literally appear as whole words in the doc's title or content
 
 # --- Leading stopword gate (UI typing nicety) ---
-_WORDS_ANY = re.compile(r"[a-z]+")
+# NOTE: include digits so "839" is kept during quick typing checks
+_WORDS_ANY = re.compile(r"[a-z0-9\(\)]+")
 
 def _tokens_all(s: str):
     return _WORDS_ANY.findall((s or "").lower())
@@ -387,7 +461,61 @@ def suggest():
         return jsonify({"q": q, "suggestions": []})
 
     q_base = " ".join(tail_tokens) if tail_tokens else q
+
+    alpha_count = sum(ch.isalpha() for ch in q_base)
+    has_digit   = any(ch.isdigit() for ch in q_base)
+    has_vs      = bool(VS_RE.search(q_base.lower()))  # e.g., "Gunasena v Bandarathilake"
+
+    if alpha_count < 3 and not has_digit and not has_vs:
+        return jsonify({"q": q, "suggestions": []})
+
     docs = load_docs_cache()
+
+# If the query is like "section 412", extract the target section number
+    sec_no = extract_section_number(q_base)  # e.g., "412" or "412(4)" or None
+
+##########
+########### SINGLE-TOKEN QUERIES (strict for short tokens; typo-tolerant for long names)
+    q_tokens_all = tokenize(q_base)
+    is_single_token = (len(q_tokens_all) == 1) and q_tokens_all[0].isalpha()
+ 
+    if is_single_token:
+        tok = q_tokens_all[0]
+        L = len(tok)
+        def _lc(x): return (x or "").lower()
+ 
+        # 1) exact whole-word hits only
+        keep = [
+            d for d in docs
+            if token_present(_lc(d.get("title")), tok) or token_present(_lc(d.get("content")), tok)
+        ]
+ 
+        if not keep:
+            if L >= 4:
+                # 2) try projecting token to corpus (handles common typos/morphs)
+                proj = project_query_to_corpus(tok)
+                ptoks = tokenize(proj)
+                if ptoks:
+                    pt = ptoks[0]
+                    if pt != tok:
+                        keep = [
+                            d for d in docs
+                            if token_present(_lc(d.get("title")), pt) or token_present(_lc(d.get("content")), pt)
+                        ]
+                # 3) as last resort for long tokens, allow near-token matches (no substrings)
+                if not keep:
+                    keep = [
+                        d for d in docs
+                        if token_near_present(_lc(d.get("title")), tok) or token_near_present(_lc(d.get("content")), tok)
+                    ]
+            else:
+                # len <= 3 (e.g., "cat"): be strict — no projection, no near-token
+                keep = []
+ 
+        docs = keep
+        if not docs:
+            return jsonify({"q": q, "suggestions": []})
+        
 
     # Title boosters are still computed for guards, but not used to pre-bias results
     vs_suggestions = _title_hits_for_vs(q_base, docs, top_n=1)
@@ -449,14 +577,27 @@ def suggest():
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # ---------- Unified scoring: pick the stronger of Title vs Content for each doc ----------
-        # ---------- Unified scoring: pick the stronger of Title vs Content for each doc ----------
     candidates = []
     qn = _norm_title_text(q_base)
     long_query = (len(tokenize(q_base)) >= 6) or (len(q_base) >= 30)
     q_lc = q_base.lower()
 
-    # anchor terms = projected non-stop vocabulary tokens (strongest hints from the query)
-    anchor_terms = [t for t in content_terms if len(t) >= 4]
+    # anchor terms = projected tokens; include numbers even if short
+    has_digit = lambda s: any(c.isdigit() for c in s)
+    # keep non-stop vocab tokens (len>=4) + any numeric-looking tokens from the projected query
+    numeric_terms = [t for t in tokenize(q_proj) if has_digit(t)]
+    if is_single_token:
+        base_anchors = [q_tokens_all[0]]  # allow 3-letter single token (e.g., "cat") as an anchor
+    else:
+        base_anchors = [t for t in content_terms if len(t) >= 4]
+
+    # dedupe while preserving order
+    seen_anchor = set()
+    anchor_terms = []
+    for t in base_anchors + numeric_terms:
+        if t not in seen_anchor:
+            seen_anchor.add(t)
+            anchor_terms.append(t)
     anchor_terms = anchor_terms[:6]  # keep it tight
 
     def _count_hits(text_lc: str, toks: list[str]) -> int:
@@ -490,7 +631,13 @@ def suggest():
         for chunk in chunks:
             chunk_lc = chunk.lower()
 
-            # literal hits on anchor terms (e.g., 'bulls', 'bullock')
+            # If the query is "section NNN", hard-prefer chunks that contain that exact phrase
+            if sec_no and has_section_phrase(chunk_lc, sec_no):
+                f = 1.0
+                exact_chunk = True
+                anchored_chunk = True
+
+            # literal hits on anchor terms (e.g., 'bulls', '839', '48(4)')
             hits_here = _count_hits(chunk_lc, anchor_terms)
             if hits_here >= 1:
                 anchored_chunk = True
@@ -501,8 +648,8 @@ def suggest():
                 fuzzy_score(vocab_key,  chunk_lc),
             )
 
-            # exact long-phrase boost when present
-            if long_query and re.search(rf"\b{re.escape(q_lc)}\b", chunk_lc):
+            # exact long-phrase boost when present (use custom boundaries instead of \b)
+            if long_query and re.search(rf"(?<![\w]){re.escape(q_lc)}(?![\w])", chunk_lc):
                 f = max(f, 0.99)
                 exact_chunk = True
 
@@ -533,22 +680,49 @@ def suggest():
                 ss = split_paragraphs(text) or split_sentences(text)
                 snippet = ss[0] if ss else ""
 
+        ###
+            # --- Numeric anchor tweak (prioritise exact number hits) ---
+        num_anchors = [t for t in anchor_terms if any(c.isdigit() for c in t)]
+        num_hits = _count_hits((snippet or "").lower(), num_anchors)
+
         # Final score: mostly similarity, backed by doc cosine
+        # Final score: mostly similarity, backed by doc cosine
+        #####
+        # --- PRIORITIZE exact "section NNN" matches in title or content ---
+        sec_exact_doc = False
+        if sec_no:
+            title_lc_full = title_lc  # already lower
+            content_lc_full = (d.get("content") or "").lower()
+            if has_section_phrase(title_lc_full, sec_no) or has_section_phrase(content_lc_full, sec_no):
+                sec_exact_doc = True
+                exact = True  # treat as exact for ranking purposes
+                # If our chosen snippet didn't include the phrase, still give it high confidence
+                channel_f = max(channel_f, 0.99)
+ 
+        # Final score: mostly similarity, backed by doc cosine; weight content more if digits involved
         content_w = 0.5 if long_query else 0.4
+        if num_anchors:
+            content_w = 0.7  # bias more toward content when numbers are in the query
+ 
         score = (content_w * channel_f + (1 - content_w) * max(d_cos, 0.0))
         if exact:
             score += 0.12
-
+        if num_hits:
+            score += 0.20
+        if sec_exact_doc:
+            score += 1.20  # BIG bump to put exact "section 412" docs at the very top
         # final gate: normally 0.78, but allow entries that have an anchor hit + reasonable cosine
         base_gate = 0.78
         if long_query:
             base_gate -= 0.03  # a touch more forgiving for long queries
+        if num_anchors:
+            base_gate -= 0.05  # slightly easier gate when digit anchors are present
 
-        # did any anchor term appear in the chosen snippet?
+        # did any (alpha or numeric) anchor term appear in the chosen snippet?
         anchored_final = _count_hits((snippet or "").lower(), anchor_terms) >= 1
 
         passes_gate = (channel_f >= base_gate) or (anchored_final and d_cos >= 0.12)
-
+        #
         if passes_gate:
             candidates.append({
                 "text": (snippet or "")[:400],

@@ -36,7 +36,7 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()  # collapse whitespace
     return t
 
-def get_embedding(text: str, model="text-embedding-ada-002"):
+def get_embedding(text: str, model="text-embedding-3-small"):  # 1536 dims
     return oa.embeddings.create(model=model, input=text).data[0].embedding
 
 def in_bucket(filename: str) -> bool:
@@ -59,8 +59,6 @@ def pdf_pages_to_b64_images(pdf_path: str, dpi: int = 300, max_dim: int = 1400):
         for page in doc:
             pix = page.get_pixmap(dpi=dpi)        # render
             png_bytes = pix.tobytes("png")        # PNG in-memory
-            
-            
             b64s.append(base64.b64encode(png_bytes).decode("utf-8"))
     return b64s
 
@@ -94,10 +92,8 @@ def ocr_pdf_with_openai(pdf_path: str, model: str = None):
     return "\n".join(parts), time.time() - t0
 
 def likely_scanned(text: str, min_chars: int = 200):
-
     t = re.sub(r"\s+", " ", (text or "")).strip()
     return len(t) < min_chars
-
 
 def main():
     pdfs = [f for f in os.listdir(PROJECT_ROOT) if f.lower().endswith(".pdf")]
@@ -108,16 +104,7 @@ def main():
     for filename in pdfs:
         local_path = os.path.join(PROJECT_ROOT, filename)
 
-        # Skip if same title already in DB
-        if sb.table("legal_documents").select("id").eq("title", filename).execute().data:
-            print("DB already has:", filename, "— skipping row insert.")
-            # ensure Storage has it (upload once if missing)
-            if not in_bucket(filename):
-                with open(local_path, "rb") as f:
-                    sb.storage.from_(BUCKET_NAME).upload(filename, f, FILE_OPTS)
-            continue
-
-        # Upload to Storage if not there
+        # --- Storage: upload once if missing (still idempotent with upsert=true) ---
         if not in_bucket(filename):
             with open(local_path, "rb") as f:
                 sb.storage.from_(BUCKET_NAME).upload(filename, f, FILE_OPTS)
@@ -135,11 +122,9 @@ def main():
         if likely_scanned(raw_text):
             print("No/low text layer → running OpenAI OCR:", filename)
             ocr_text, secs = ocr_pdf_with_openai(local_path)
-
             text = ocr_text
         else:
             text = raw_text
-
 
         # Clean + embed
         cleaned = clean_text(text)
@@ -149,15 +134,30 @@ def main():
             print("Embedding failed:", filename, e)
             continue
 
-        # Insert row (embedding column is vector → send list)
-        sb.table("legal_documents").insert({
+        row = {
             "title": filename,
             "content": text,
             "embedding": emb,
             "file_url": url
-        }).execute()
+        }
 
-        print("Inserted DB row:", filename)
+        # --- DB write: UPSERT by title (replace existing, insert new) ---
+        # Requires a UNIQUE constraint on legal_documents.title
+        try:
+            sb.table("legal_documents").upsert(row, on_conflict="title").execute()
+            print("Upserted DB row:", filename)
+        except Exception as e:
+            # Fallback: if no unique constraint on title, update by title or insert if none
+            try:
+                existing = sb.table("legal_documents").select("id").eq("title", filename).execute().data
+                if existing:
+                    sb.table("legal_documents").update(row).eq("title", filename).execute()
+                    print("Updated DB row (by title):", filename)
+                else:
+                    sb.table("legal_documents").insert(row).execute()
+                    print("Inserted DB row:", filename)
+            except Exception as e2:
+                print("DB write failed for", filename, "→", e2)
 
 if __name__ == "__main__":
     main()

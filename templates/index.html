@@ -82,8 +82,9 @@
   function debounce(fn, ms) { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
   function escapeHTML(s){ return (s??"").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
 
-  // Token-based highlighting (ignores common stopwords; simple plural handling)
-  const TOKEN_RE = /[a-z][a-z\-]{2,}/g;
+  // Token-based highlighting (now also keeps numbers like 32, 839, and forms like 48(4))
+  // NOTE: keep STOP the same; numeric tokens will pass through.
+  const TOKEN_RE = /(?:[a-z][a-z\-]{2,}|\d+(?:\([0-9a-z]{1,3}\))?)/gi;
   const STOP = new Set(["the","a","an","of","and","or","if","to","in","on","for","with","by",
                         "is","are","be","was","were","at","from","as","that","this","these","those","it","about"]);
 
@@ -95,8 +96,9 @@
   function highlightTokens(text, tokens){
     if(!text || !tokens?.length) return escapeHTML(text || "");
     const parts = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    // plural-ish end: (s|es)?; word boundaries for clean matches
-    const re = new RegExp(`\\b(${parts.join("|")})(?:s|es)?\\b`, "gi");
+    // Use custom "wordish" boundaries so tokens like 48(4) highlight.
+    // Keep optional (s|es)? to still catch simple plurals for alphabetic tokens.
+    const re = new RegExp(`(?<![A-Za-z0-9_])(${parts.join("|")})(?:s|es)?(?![A-Za-z0-9_])`, "gi");
     let out = "", last = 0, raw = text || "", m;
     while((m = re.exec(raw)) !== null){
       out += escapeHTML(raw.slice(last, m.index));
@@ -148,6 +150,19 @@
         <div class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></div>
         <div class="small text-muted">Searching…</div>
       </div>`;
+    
+    // Require at least 3 letters OR any digit OR an "X v Y" pattern before querying
+    const letters  = (q.match(/[A-Za-z]/g) || []).length;
+    const hasDigit = /\d/.test(q);
+    const hasVs    = /\b[a-z][a-z\-]{2,}\s+v(?:s\.?)?\s+[a-z][a-z\-]{1,}\b/i.test(q);
+
+    if (letters < 3 && !hasDigit && !hasVs) {
+      hideSuggestions();
+      setStatus("Keep typing to see results…", "info");
+      showEmptyInfo(false);
+      return;
+    }
+
 
     try{
       const r = await fetch("/suggest?" + new URLSearchParams({ q, k: 8 }));
@@ -198,7 +213,6 @@
 
   // EVENTS
   // Keep results visible: do NOT auto-hide when clicking blank space anymore.
-  // (We intentionally removed the old document-level click handler.)
 
   // Clicking inside a suggestion snippet just closes the dropdown (doesn't change the query)
   document.getElementById("suggestions").addEventListener("click", (e)=>{
